@@ -1,4 +1,5 @@
 /** Native Claude Code Mods pane. No npm dependencies or build step. */
+import { band } from './band.js';
 const PANE = 'workers';
 const LABELS = { codex: 'Codex', qwen: 'Qwen Code', opencode: 'OpenCode' };
 const ACTIVE = ['starting', 'running', 'waiting', 'interrupting'];
@@ -557,11 +558,11 @@ export function register(on) {
     const { Box, Button, Text } = $.ui.resolve(e);
     const running = state.workers.filter(w => ACTIVE.includes(w.status)).length;
     const waiting = state.workers.filter(w => w.status === 'waiting').length;
-    return Box({ key: 'workers-band-row', flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', columnGap: 1, rowGap: 1, children: [previous, Box({ key: 'workers-band', flexDirection: 'row', alignItems: 'center', columnGap: 2, children: [
+    // One row of buttons shared with the other mods, their lines in a list under it (hooks/band.js).
+    return band(Box, previous, [
       Button({ key: 'open-workers', label: 'Workers' + (state.workers.length ? ' · ' + state.workers.length : ''),
         onPress: async () => { try { await openPanel($, true); } catch (exc) { error = String(exc.message || exc); $.ui.log('Workers panel: ' + error); $.ui.invalidate('ui.render'); } } }),
-      ...(waiting || running ? [Text({ dimColor: !waiting, color: waiting ? 'yellow' : undefined, children: [waiting ? waiting + ' need input' : running + ' active'] })] : []),
-    ] })] });
+    ], waiting || running ? [Text({ dimColor: !waiting, color: waiting ? 'yellow' : undefined, children: ['Workers · ' + (waiting ? waiting + ' need input' : running + ' active')] })] : []);
   });
 
   on('ui.render', { component: 'Pane' }, async ($, e, next) => {

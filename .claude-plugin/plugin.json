@@ -1,6 +1,6 @@
 {
   "name": "workers",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "description": "Run, watch and steer Codex, Qwen Code and OpenCode coding agents from a native Claude Code pane, and let Claude delegate tasks to them through session-scoped tools.",
   "author": {
     "name": "ai",
