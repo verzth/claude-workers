@@ -32,6 +32,10 @@ through a small Python bridge that runs on `127.0.0.1`.
 Every worker keeps its own login, model and native history. The bridge only starts the CLI, relays messages and
 events, and asks you before a worker does something that needs approval.
 
+<p align="center">
+  <img src="docs/screenshots/overview.png" alt="Workers overview: a Codex worker in the Working section" width="480">
+</p>
+
 ## Features
 
 - **Workers pane** with an overview of every worker: task, CLI, status, last update, origin and latest activity.
@@ -132,6 +136,11 @@ Or ask Claude to delegate:
 > Delegate the test run to Qwen with worker_start, carry on with your review, and use worker_wait before you conclude anything from the result.
 
 ## The Workers pane
+
+<p align="center">
+  <img src="docs/screenshots/chat.png" alt="Worker detail, Chat tab: the brief sent by Claude and the worker's reply" width="400">
+  <img src="docs/screenshots/activity.png" alt="Worker detail, Activity tab: the worker's tool calls with their status" width="400">
+</p>
 
 **Overview.** Workers are grouped into three collapsible sections, always in this order:
 
