@@ -1,0 +1,11 @@
+{
+  "name": "workers",
+  "version": "0.6.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "python3 -m unittest discover -s tests -v",
+    "test:panel": "claude plugin test .",
+    "validate": "claude plugin validate --strict ."
+  }
+}

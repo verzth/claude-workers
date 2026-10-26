@@ -1,0 +1,4 @@
+{
+  "description": "Claude workers pane and session-scoped worker tools",
+  "modules": ["./register.js"]
+}

@@ -1,0 +1,23 @@
+{
+  "name": "workers",
+  "version": "0.6.0",
+  "description": "Run, watch and steer Codex, Qwen Code and OpenCode coding agents from a native Claude Code pane, and let Claude delegate tasks to them through session-scoped tools.",
+  "author": {
+    "name": "ai",
+    "url": "https://git.verzth.work/ai"
+  },
+  "homepage": "https://git.verzth.work/ai/claude-workers",
+  "repository": "https://git.verzth.work/ai/claude-workers",
+  "license": "MIT",
+  "keywords": [
+    "workers",
+    "agents",
+    "codex",
+    "qwen-code",
+    "opencode",
+    "acp",
+    "delegation",
+    "pane",
+    "mod"
+  ]
+}
