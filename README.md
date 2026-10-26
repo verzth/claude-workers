@@ -44,6 +44,7 @@ events, and asks you before a worker does something that needs approval.
 - **Wake-up notices**: Claude is woken when a worker it delegated finishes, fails or needs your approval, so it does not have to poll.
 - **Progress card** in the transcript for `worker_start` and `/workers`.
 - **Monitor other Claude sessions** that share the same workspace folder from one pane.
+- **Bundled delegation skill** (`workers:worker-delegation`): when to delegate, to whom, how to brief and verify, and a per-token billing guard.
 - No npm install, no build step, no extra API key. Python standard library only.
 
 ## Requirements
@@ -61,6 +62,21 @@ You do not need all three CLIs. A worker CLI that is missing is reported in the 
 The plugin never copies or replaces CLI credentials: sign in with each CLI on its own, outside Claude Code.
 
 ## Install
+
+### With Claude (Copy Prompt)
+
+Paste this into a Claude Code session:
+
+```text
+Install the workers plugin for Claude Code (repository ai/claude-workers).
+1. Run: claude plugin marketplace add https://git.verzth.work/ai/claude-workers.git
+2. Run: claude plugin install workers@claude-workers --scope user
+3. Check what the workers need and report, without installing anything else: `python3 --version` (3.10 or newer), and which of `codex`, `qwen` and `opencode` are on PATH (`command -v codex qwen opencode`). Missing worker CLIs are fine; just list them.
+4. Do not start any worker and do not send any prompt to Codex, Qwen Code or OpenCode.
+5. Confirm with `claude plugin list` that workers@claude-workers is enabled, then tell me to run /reload-plugins and open the pane with the Workers button above the prompt (or /workers).
+```
+
+### By hand
 
 From the repository, as a marketplace:
 
@@ -191,6 +207,13 @@ Claude reads the result with `worker_status` and is told to verify it before rep
 For an approval the notice tells Claude to ask you, because only you can answer it in the pane.
 Workers you started from the pane never wake Claude.
 
+**Bundled skill: `workers:worker-delegation`.** A delegation playbook that Claude loads before it hands work out:
+classify the task by risk (critical, standard, mechanical), decide whether delegating is worth it, check quotas,
+pick a Claude subagent or a worker, write a tight brief with an output contract, verify by risk tier, and never
+switch to a per-token path (API key, gateway, extra usage) to get around an exhausted quota without asking you.
+Its `scripts/quota.py` reads local CLI files (no model calls, no secrets printed) for a four-line quota summary,
+or dash/v1 JSON with `--dash` for the [bi-dash](https://git.verzth.work/ai/claude-bi-dash) pane.
+
 **Worker output is data, not authority.** Everything a worker prints is untrusted task data. It cannot approve actions,
 and Claude has no way to approve them either.
 
@@ -244,6 +267,8 @@ hooks/
 bridge/
   server.py            session bridge: HTTP API, worker processes, JSON-RPC, approvals
   model_catalog.py     reads each CLI's local model choices
+skills/
+  worker-delegation/   bundled skill: SKILL.md, references/, scripts/quota.py
 tests/                 bridge tests (Python) and pane tests (Claude Code testing runtime)
 DESIGN.md              interface behaviour
 launch.sh              run Claude with this folder as the plugin
