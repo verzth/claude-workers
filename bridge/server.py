@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import collections
 import hashlib
 import hmac
@@ -25,12 +26,25 @@ from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
-VERSION = "0.4.1"
+VERSION = "0.5.0"
 RUNTIME_KEY_VERSION = "0.2.0"  # Compatible 0.2.x updates reconnect to the same live bridge.
 COMMANDS = {"codex": ["codex", "app-server", "--stdio"],
             "qwen": ["qwen", "--acp"], "opencode": ["opencode", "acp"]}
 ACTIVE = {"starting", "running", "waiting", "interrupting"}
 ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
+# Attachments are copied into the worker's own folder, so every CLI (and its sandbox) can read
+# them, and the worker gets a path instead of the bytes.
+ATTACH_DIR = (".claude", "worker-files")
+ATTACH_EXCLUDE = ".claude/worker-files/"
+MAX_ATTACHMENTS = 10
+MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
+MAX_ATTACHMENTS_TOTAL = 50 * 1024 * 1024
+MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+        ".webp": "image/webp", ".pdf": "application/pdf", ".txt": "text/plain", ".md": "text/markdown",
+        ".csv": "text/csv", ".json": "application/json", ".html": "text/html", ".svg": "image/svg+xml",
+        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"}
+IMAGE_EXT = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif", "image/webp": ".webp"}
 
 
 def clean(value, limit=4000):
@@ -43,6 +57,86 @@ def checked_text(value, name="message"):
     if not isinstance(value, str) or not value.strip() or len(value) > 32000:
         raise ValueError(f"{name} must contain 1–32000 characters")
     return value.strip()
+
+
+def human_size(n):
+    return f"{n} B" if n < 1024 else f"{n / 1024:.0f} KB" if n < 1024 * 1024 else f"{n / 1024 / 1024:.1f} MB"
+
+
+def safe_name(name, fallback="file"):
+    name = re.sub(r"[^\w.\-]+", "-", Path(name).name).strip(".-")[:80]
+    return name or fallback
+
+
+def checked_attachments(files, images):
+    files = files or []
+    images = images or []
+    if not isinstance(files, list) or not all(isinstance(f, str) and f for f in files):
+        raise ValueError("files must be a list of absolute paths")
+    if not isinstance(images, list) or not all(isinstance(n, int) and not isinstance(n, bool) and 0 < n < 100000 for n in images):
+        raise ValueError("images must be a list of pasted image numbers")
+    if len(files) + len(images) > MAX_ATTACHMENTS:
+        raise ValueError(f"At most {MAX_ATTACHMENTS} attachments per message")
+    return files, images
+
+
+def transcript_path(session, workspace):
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", session or "") or not workspace:
+        return None
+    project = re.sub(r"[^A-Za-z0-9]", "-", workspace)
+    config = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
+    return config / "projects" / project / (session + ".jsonl")
+
+
+def chat_images(session, workspace, numbers):
+    """Images pasted into the Claude chat live only in its transcript, as base64 blocks numbered
+    by imagePasteIds. Returns {number: (media type, base64)}; a later paste with the same number wins."""
+    path = transcript_path(session, workspace)
+    if path is None or not path.is_file():
+        raise ValueError("Pasted images are unavailable: this Claude session's transcript was not found")
+    wanted, found = set(numbers), {}
+    with path.open(encoding="utf-8", errors="replace") as file:
+        for line in file:
+            if '"imagePasteIds"' not in line:
+                continue
+            try:
+                item = json.loads(line)
+                ids = item.get("imagePasteIds") or []
+                content = item.get("message", {}).get("content")
+                blocks = [b for b in content if isinstance(b, dict) and b.get("type") == "image"] \
+                    if isinstance(content, list) else []
+            except (ValueError, TypeError, AttributeError):
+                continue
+            for number, block in zip(ids, blocks):
+                source = block.get("source") or {}
+                if number in wanted and source.get("type") == "base64" and isinstance(source.get("data"), str):
+                    found[number] = (source.get("media_type") or "image/png", source["data"])
+    missing = [n for n in numbers if n not in found]
+    if missing:
+        raise ValueError("Pasted image " + ", ".join(f"#{n}" for n in missing) + " is not in this Claude session")
+    return found
+
+
+def exclude_from_git(cwd):
+    """Keeps the copies out of git status through the repository's local exclude file (never committed)."""
+    try:
+        out = subprocess.run(["git", "-C", cwd, "rev-parse", "--git-path", "info/exclude"],
+                             capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return
+    if out.returncode != 0 or not out.stdout.strip():
+        return
+    path = Path(out.stdout.strip())
+    path = path if path.is_absolute() else Path(cwd) / path
+    try:
+        existing = path.read_text() if path.exists() else ""
+        if ATTACH_EXCLUDE in existing.splitlines():
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as file:
+            file.write(("\n" if existing and not existing.endswith("\n") else "") + ATTACH_EXCLUDE + "\n")
+    except OSError:
+        pass
 
 
 class Rpc:
@@ -202,6 +296,8 @@ class Worker:
         self.cancelled = False
         self.closed = False
         self.generation = 0
+        self.files = []       # every attachment copied for this worker
+        self.task_files = []  # the ones that came with the first task (a retry copies them again)
         self.record("lifecycle", f"Starting {kind}")
 
     def record(self, kind, text, **extra):
@@ -218,8 +314,102 @@ class Worker:
                     "queued": len(self.messages), "tools": list(self.tools.values()),
                     "events": list(self.events), "history": [dict(m) for m in self.history],
                     "nativeSessionId": self.session_id, "canMessage": bool(self.session_id) and not self.closed,
+                    "files": [{k: a[k] for k in ("name", "rel", "mime", "size")} for a in self.files],
                     "approvals": [{k: v for k, v in a.items() if k not in {"event", "answer"}}
                                   for a in self.approvals.values()]}
+
+    def files_dir(self):
+        return Path(self.cwd).joinpath(*ATTACH_DIR, self.id)
+
+    def stage(self, files=None, images=None, session="", workspace=""):
+        """Copies attachments into <cwd>/.claude/worker-files/<id>/ and returns their descriptions."""
+        files, images = checked_attachments(files, images)
+        if not files and not images:
+            return []
+        sources = []
+        for raw in files:
+            src = Path(raw)
+            if not src.is_absolute():
+                raise ValueError(f"Attachment path must be absolute: {raw}")
+            try:
+                src = src.resolve(strict=True)
+            except OSError:
+                raise ValueError(f"Attachment not found: {raw}") from None
+            if not src.is_file():
+                raise ValueError(f"Attachment is not a file: {raw}")
+            size = src.stat().st_size
+            if size > MAX_ATTACHMENT_BYTES:
+                raise ValueError(f"Attachment over {human_size(MAX_ATTACHMENT_BYTES)}: {src.name}")
+            sources.append(("file", src, size))
+        pasted = chat_images(session, workspace, images) if images else {}
+        for number in images:
+            mime, data = pasted[number]
+            sources.append(("image", (number, mime, data), len(data) * 3 // 4))
+        if sum(s[2] for s in sources) > MAX_ATTACHMENTS_TOTAL:
+            raise ValueError(f"Attachments over {human_size(MAX_ATTACHMENTS_TOTAL)} in total")
+
+        dest = self.files_dir()
+        dest.mkdir(parents=True, exist_ok=True)
+        # A symlinked .claude must not send copies outside the worker's folder.
+        if not dest.resolve().is_relative_to(Path(self.cwd)):
+            raise ValueError("Attachment folder resolves outside this worker's workspace")
+        taken = {p.name for p in dest.iterdir()}
+        staged = []
+        for kind, src, _ in sources:
+            if kind == "file":
+                name = safe_name(src.name)
+            else:
+                number, mime, _ = src
+                name = f"pasted-image-{number}{IMAGE_EXT.get(mime, '.png')}"
+            stem, ext = os.path.splitext(name)
+            serial = 1
+            while name in taken:
+                serial += 1
+                name = f"{stem}-{serial}{ext}"
+            taken.add(name)
+            target = dest / name
+            if kind == "file":
+                shutil.copyfile(src, target)
+            else:
+                target.write_bytes(base64.b64decode(src[2], validate=False))
+            mime = MIME.get(target.suffix.lower(), "application/octet-stream") if kind == "file" else src[1]
+            staged.append({"name": name, "path": str(target), "rel": str(target.relative_to(self.cwd)),
+                           "mime": mime, "size": target.stat().st_size, "image": mime in IMAGE_EXT})
+        exclude_from_git(self.cwd)
+        with self.lock:
+            self.files.extend(staged)
+        self.record("lifecycle", "Attached " + ", ".join(a["name"] for a in staged))
+        return staged
+
+    def remove_files(self):
+        """Deletes this worker's copies (never the originals), and the shared folder once empty."""
+        target = self.files_dir()
+        try:
+            if target.is_symlink() or not target.is_dir() or not target.resolve().is_relative_to(Path(self.cwd)):
+                return
+            shutil.rmtree(target, ignore_errors=True)
+            target.parent.rmdir()  # only succeeds when no other worker's files remain
+        except OSError:
+            pass
+
+    @staticmethod
+    def compose(text, files):
+        if not files:
+            return text
+        lines = [f"- {a['rel']} ({a['mime']}, {human_size(a['size'])})" for a in files]
+        return (text + "\n\nAttached files, copied into this workspace for you (paths are relative to it; "
+                "open them from disk):\n" + "\n".join(lines))
+
+    def _codex_input(self, item):
+        text = self.compose(item["text"], item["files"])
+        return [{"type": "text", "text": text, "text_elements": []}] + \
+               [{"type": "localImage", "path": a["path"]} for a in item["files"] if a["image"]]
+
+    def _acp_prompt(self, item):
+        text = self.compose(item["text"], item["files"])
+        return [{"type": "text", "text": text}] + \
+               [{"type": "resource_link", "uri": Path(a["path"]).as_uri(), "name": a["name"],
+                 "mimeType": a["mime"], "size": a["size"]} for a in item["files"]]
 
     def start(self):
         threading.Thread(target=self._work, daemon=True).start()
@@ -254,7 +444,7 @@ class Worker:
                 if self.cancelled or self.closed:
                     return
                 if self.task:
-                    self.messages.append(self.task)
+                    self.messages.append({"text": self.task, "files": self.task_files})
                 else:
                     self.status = "idle"
                     self.record("lifecycle", "Session ready. Send your first message.")
@@ -263,7 +453,8 @@ class Worker:
                     self.condition.wait_for(lambda: self.messages or self.closed)
                     if self.closed:
                         break
-                    prompt = self.messages.popleft()
+                    item = self.messages.popleft()
+                    prompt = self.compose(item["text"], item["files"])
                     self.cancelled = False
                     self.status = "running"
                     self.generation += 1
@@ -275,7 +466,7 @@ class Worker:
                 self.record("message", prompt, role="user")
                 if self.kind == "codex":
                     turn = self.rpc.call("turn/start", {"threadId": self.session_id,
-                        "input": [{"type": "text", "text": prompt, "text_elements": []}]})
+                        "input": self._codex_input(item)})
                     with self.lock:
                         self.turn_id = turn["turn"]["id"]
                     while not self.completion.wait(0.5):
@@ -285,7 +476,7 @@ class Worker:
                         raise RuntimeError(self.error)
                 else:
                     answer = self.rpc.call("session/prompt", {"sessionId": self.session_id,
-                        "prompt": [{"type": "text", "text": prompt}]}, timeout=86400)
+                        "prompt": self._acp_prompt(item)}, timeout=86400)
                     if answer.get("stopReason") == "cancelled":
                         self.cancelled = True
                 with self.lock:
@@ -491,8 +682,9 @@ class Worker:
                 raise ValueError(f"Model {self.model!r} is not offered by this {self.kind} session")
         self.rpc.call("session/set_model", {"sessionId": self.session_id, "modelId": self.model})
 
-    def send(self, message):
+    def send(self, message, files=None):
         message = checked_text(message)
+        item = {"text": message, "files": files or []}
         with self.lock:
             if not self.session_id or self.closed:
                 raise ValueError("Worker is not ready; start a new worker if it has closed")
@@ -501,9 +693,10 @@ class Worker:
             if turn is None:
                 if len(self.messages) >= 12:
                     raise ValueError("Message queue is full (12); wait or interrupt")
-                self.messages.append(message)
+                self.messages.append(item)
                 if not self.task:
                     self.task = message
+                    self.task_files = item["files"]
                 if self.status in {"idle", "done", "interrupted"}:
                     self.status = "running"
                 self.record("message", "Queued: " + message, role="user")
@@ -511,9 +704,10 @@ class Worker:
                 return "queued"
         try:
             self.rpc.call("turn/steer", {"threadId": self.session_id, "expectedTurnId": turn,
-                "input": [{"type": "text", "text": message, "text_elements": []}]})
+                "input": self._codex_input(item)})
             with self.lock:
-                self.history.append({"role": "user", "text": clean(message, 6000), "at": time.time(), "steered": True})
+                self.history.append({"role": "user", "text": clean(self.compose(message, item["files"]), 6000),
+                                     "at": time.time(), "steered": True})
             self.record("message", "Sent to active turn: " + message, role="user")
             return "steered"
         except Exception:
@@ -590,16 +784,26 @@ class Manager:
             if origin not in {"delegated", "direct", "unknown"}:
                 raise ValueError("Invalid worker origin")
             w = Worker(data.get("kind"), data.get("cwd", ""), None if empty else checked_text(data.get("task"), "task"), model, origin=origin)
+            if not empty:
+                try:
+                    w.task_files = w.stage(data.get("files"), data.get("images"), self.session, self.workspace)
+                except Exception:
+                    w.remove_files()
+                    raise
             self.workers[w.id] = w
             w.start()
             return w.snapshot()
 
-    def send(self, wid, message):
+    def send(self, wid, message, files=None, images=None):
         with self.lock:
             w = self.get(wid)
             if w.status not in ACTIVE and sum(x.status in ACTIVE for x in self.workers.values()) >= 6:
                 raise ValueError("At most 6 workers may run at once")
-            return w.send(message)
+            checked_text(message)
+            if not w.session_id or w.closed:
+                raise ValueError("Worker is not ready; start a new worker if it has closed")
+            staged = w.stage(files, images, self.session, self.workspace)
+            return w.send(message, staged)
 
     def get(self, wid):
         with self.lock:
@@ -713,6 +917,7 @@ class Manager:
         w = self.get(data.get("id"))
         if route == "delete":
             w.close()
+            w.remove_files()
             with self.lock:
                 self.workers.pop(w.id, None)
             return {"ok": True, "removed": True}
@@ -721,10 +926,11 @@ class Manager:
                 if w.status != "error":
                     raise ValueError("Only failed workers can be retried")
                 task = checked_text(w.task, "original task") if w.task else None
-                return self.start({"kind": w.kind, "cwd": w.cwd, "task": task,
-                                   "model": w.model, "origin": w.origin}, empty=task is None)
+                return self.start({"kind": w.kind, "cwd": w.cwd, "task": task, "model": w.model, "origin": w.origin,
+                                   "files": [a["path"] for a in w.task_files if Path(a["path"]).is_file()]},
+                                  empty=task is None)
         if route == "send":
-            return {"delivery": self.send(w.id, data.get("message"))}
+            return {"delivery": self.send(w.id, data.get("message"), data.get("files"), data.get("images"))}
         if route == "interrupt":
             w.interrupt()
         elif route == "close":
@@ -743,6 +949,8 @@ class Manager:
             t.start()
         for t in threads:
             t.join(4)
+        for w in workers:
+            w.remove_files()
 
 
 def make_handler(manager, token):
@@ -829,11 +1037,9 @@ def write_connection(path, conn):
 
 def session_title(session, workspace):
     fallback = "Claude session " + session[:8]
-    if not re.fullmatch(r"[A-Za-z0-9_-]+", session):
+    path = transcript_path(session, workspace)
+    if path is None:
         return fallback
-    project = re.sub(r"[^A-Za-z0-9]", "-", workspace)
-    config = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
-    path = config / "projects" / project / (session + ".jsonl")
     try:
         with path.open("rb") as file:
             head = file.read(256000).decode("utf-8", errors="replace")

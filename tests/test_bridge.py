@@ -1,5 +1,7 @@
 import importlib.util
 import json
+import os
+import re
 from pathlib import Path
 import sys
 import tempfile
@@ -298,3 +300,149 @@ class HttpTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AttachmentTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name).resolve()
+        self.work = self.root / "project"
+        self.work.mkdir()
+        self.src = self.root / "outside"
+        self.src.mkdir()
+        (self.src / "shot.png").write_bytes(b"\x89PNG\r\n\x1a\nfake")
+        (self.src / "spec sheet.pdf").write_bytes(b"%PDF-1.4 fake")
+        self.workers = []
+
+    def tearDown(self):
+        for w in self.workers:
+            w.close()
+        self.tmp.cleanup()
+
+    def manager(self, session="sess-1"):
+        m = bridge.Manager(session)
+        m.workspace = str(self.work)
+        return m
+
+    def start(self, m, kind, task, **extra):
+        orig = bridge.COMMANDS[kind]
+        bridge.COMMANDS[kind] = [sys.executable, str(ROOT / "tests/fake_agent.py")]
+        try:
+            snap = m.start({"kind": kind, "cwd": str(self.work), "task": task, **extra})
+        finally:
+            bridge.COMMANDS[kind] = orig
+        w = m.get(snap["id"])
+        self.workers.append(w)
+        return w
+
+    def test_files_are_copied_and_codex_gets_local_images(self):
+        m = self.manager()
+        w = self.start(m, "codex", "look at these", files=[str(self.src / "shot.png"), str(self.src / "spec sheet.pdf")])
+        wait_until(lambda: w.status == "done")
+        folder = self.work / ".claude" / "worker-files" / w.id
+        self.assertEqual(sorted(p.name for p in folder.iterdir()), ["shot.png", "spec-sheet.pdf"])
+        self.assertEqual((folder / "shot.png").read_bytes(), (self.src / "shot.png").read_bytes())
+        self.assertIn(f".claude/worker-files/{w.id}/spec-sheet.pdf (application/pdf", w.output)
+        # Only the image is sent as localImage; the PDF is named in the text.
+        self.assertIn(f"[localImage: {folder / 'shot.png'}]", w.output)
+        self.assertEqual([f["rel"] for f in w.snapshot()["files"]],
+                         [f".claude/worker-files/{w.id}/shot.png", f".claude/worker-files/{w.id}/spec-sheet.pdf"])
+
+    def test_acp_gets_resource_links_for_every_file(self):
+        m = self.manager()
+        w = self.start(m, "qwen", "read it", files=[str(self.src / "spec sheet.pdf")])
+        wait_until(lambda: w.status == "done")
+        uri = (self.work / ".claude" / "worker-files" / w.id / "spec-sheet.pdf").as_uri()
+        self.assertIn(f"[resource_link: {uri}]", w.output)
+
+    def test_followup_attachment_and_name_clash(self):
+        m = self.manager()
+        w = self.start(m, "opencode", "first", files=[str(self.src / "shot.png")])
+        wait_until(lambda: w.status == "done")
+        m.send(w.id, "again", files=[str(self.src / "shot.png")])
+        wait_until(lambda: w.status == "done" and "again" in w.output)
+        self.assertIn(f"/{w.id}/shot-2.png", w.output)
+
+    def test_delete_removes_copies_but_not_originals(self):
+        m = self.manager()
+        w = self.start(m, "codex", "x", files=[str(self.src / "shot.png")])
+        wait_until(lambda: w.status == "done")
+        m.worker_action("delete", {"id": w.id})
+        self.assertFalse((self.work / ".claude" / "worker-files").exists())
+        self.assertTrue((self.work / ".claude").is_dir())
+        self.assertTrue((self.src / "shot.png").is_file())
+
+    def test_git_exclude_is_added_once(self):
+        import subprocess
+        subprocess.run(["git", "init", "-q", str(self.work)], check=True)
+        m = self.manager()
+        for _ in range(2):
+            w = self.start(m, "codex", "x", files=[str(self.src / "shot.png")])
+            wait_until(lambda: w.status == "done")
+        exclude = (self.work / ".git" / "info" / "exclude").read_text().splitlines()
+        self.assertEqual(exclude.count(".claude/worker-files/"), 1)
+        status = subprocess.run(["git", "-C", str(self.work), "status", "--porcelain", "--untracked-files=all"],
+                                capture_output=True, text=True).stdout
+        self.assertNotIn("worker-files", status)
+
+    def test_pasted_images_come_from_the_transcript(self):
+        import base64
+        config = self.root / "config"
+        project = config / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(self.work))
+        project.mkdir(parents=True)
+        old, new = base64.b64encode(b"old image").decode(), base64.b64encode(b"new image").decode()
+        lines = [
+            {"type": "user", "imagePasteIds": [1, 2], "message": {"content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": old}},
+                {"type": "text", "text": "two pictures"}]}},
+            {"type": "user", "imagePasteIds": [2], "message": {"content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": new}}]}},
+        ]
+        (project / "sess-1.jsonl").write_text("\n".join(json.dumps(l) for l in lines) + "\n")
+        prev = os.environ.get("CLAUDE_CONFIG_DIR")
+        os.environ["CLAUDE_CONFIG_DIR"] = str(config)
+        try:
+            m = self.manager("sess-1")
+            w = self.start(m, "codex", "see image", images=[2])
+            wait_until(lambda: w.status == "done")
+            saved = self.work / ".claude" / "worker-files" / w.id / "pasted-image-2.jpg"
+            self.assertEqual(saved.read_bytes(), b"new image")
+            with self.assertRaisesRegex(ValueError, "#7"):
+                self.start(m, "codex", "missing", images=[7])
+        finally:
+            if prev is None:
+                os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            else:
+                os.environ["CLAUDE_CONFIG_DIR"] = prev
+
+    def test_bad_attachments_are_refused_before_the_worker_starts(self):
+        m = self.manager()
+        for files, message in [(["relative.png"], "absolute"), ([str(self.src / "nope.png")], "not found"),
+                               ([str(self.src)], "not a file"), ([str(self.src / "shot.png")] * 11, "At most 10")]:
+            with self.assertRaisesRegex(ValueError, message):
+                self.start(m, "codex", "x", files=files)
+        self.assertEqual(m.workers, {})
+        self.assertFalse((self.work / ".claude" / "worker-files").exists())
+
+    def test_symlinked_folder_outside_the_workspace_is_refused(self):
+        (self.work / ".claude").symlink_to(self.src)
+        m = self.manager()
+        with self.assertRaisesRegex(ValueError, "outside"):
+            self.start(m, "codex", "x", files=[str(self.src / "shot.png")])
+
+    def test_retry_copies_the_task_attachments_again(self):
+        m = self.manager()
+        w = self.start(m, "codex", "x", files=[str(self.src / "shot.png")])
+        wait_until(lambda: w.status == "done")
+        w.status = "error"
+        orig = bridge.COMMANDS["codex"]
+        bridge.COMMANDS["codex"] = [sys.executable, str(ROOT / "tests/fake_agent.py")]
+        try:
+            again = m.worker_action("retry", {"id": w.id})
+        finally:
+            bridge.COMMANDS["codex"] = orig
+        w2 = m.get(again["id"])
+        self.workers.append(w2)
+        wait_until(lambda: w2.status == "done")
+        self.assertTrue((self.work / ".claude" / "worker-files" / w2.id / "shot.png").is_file())

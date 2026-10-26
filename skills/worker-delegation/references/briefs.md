@@ -8,6 +8,7 @@ main-loop tokens.
 ```text
 GOAL: <one sentence describing the end result>
 CONTEXT: <only the facts needed: stack, decisions already made, why>
+ATTACHED: <what each attached file is for, e.g. "the screenshot shows the broken header"; omit when none>
 SCOPE: may change <exact files/dirs>. DO NOT touch <files/dirs/areas>. Do not commit, push or deploy.
 CONSTRAINTS: <versions, code style, and any coding-standards skill the project has, which you must follow>
 DONE WHEN: <measurable acceptance criteria>

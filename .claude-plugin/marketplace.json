@@ -12,7 +12,7 @@
       "name": "workers",
       "source": "./",
       "description": "Run and supervise Codex, Qwen Code and OpenCode workers from a native Claude Code pane.",
-      "version": "0.7.0"
+      "version": "0.8.0"
     }
   ]
 }

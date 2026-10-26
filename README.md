@@ -45,6 +45,7 @@ events, and asks you before a worker does something that needs approval.
 - **Approvals in the pane**: **Allow once** or **Deny**. Nothing is approved on your behalf.
 - **Interrupt**, **Close session**, **Archive**, **Delete** and **Retry** for failed workers.
 - **Delegation from Claude**: `worker_start`, `worker_status`, `worker_send`, `worker_interrupt`, `worker_wait`.
+- **Attachments as file pointers**: screenshots, PDFs or files from your chat are copied into the worker's folder (`.claude/worker-files/<worker-id>/`) and the worker gets the path; Codex sees images directly.
 - **Wake-up notices**: Claude is woken when a worker it delegated finishes, fails or needs your approval, so it does not have to poll.
 - **Progress card** in the transcript for `worker_start` and `/workers`.
 - **Monitor other Claude sessions** that share the same workspace folder from one pane.
@@ -202,13 +203,35 @@ The full names use the `mcp__workers__` prefix, for example `mcp__workers__worke
 
 | Tool | Parameters | What it does |
 |---|---|---|
-| `worker_start` | `kind` (`codex`, `qwen`, `opencode`), `task`; optional `cwd` (absolute path, default: the session folder), `model` | Starts a worker and returns right away with its `id`, status and folder. Opens the Workers pane. |
+| `worker_start` | `kind` (`codex`, `qwen`, `opencode`), `task`; optional `cwd` (absolute path, default: the session folder), `model`, `files`, `images` | Starts a worker and returns right away with its `id`, status and folder. Opens the Workers pane. |
 | `worker_status` | optional `id` | Without `id`, lists this session's workers; with `id`, returns that one. Each entry has the status, queued message count, error, native session ID, recent output, the last 8 tool calls and pending approval requests. |
-| `worker_send` | `id`, `message` | Sends a follow-up. Codex steers the running turn; Qwen Code and OpenCode queue it. Returns the delivery (`steered` or `queued`). Never approves anything. |
+| `worker_send` | `id`, `message`; optional `files`, `images` | Sends a follow-up. Codex steers the running turn; Qwen Code and OpenCode queue it. Returns the delivery (`steered` or `queued`). Never approves anything. |
 | `worker_interrupt` | `id` | Interrupts the worker and clears its queue. Falls back to terminating its process group after five seconds. |
 | `worker_wait` | `id`; optional `timeout_ms` (0 to 7000, default 5000) | Waits briefly until the worker finishes, fails or needs input, then returns its state. On timeout it returns the running state; call it again if you want to keep waiting. |
 
 `task` and `message` take 1 to 32,000 characters.
+
+**Attachments.** A worker cannot see what you attach in the Claude chat, so `worker_start` and `worker_send` hand files
+over as pointers:
+
+| Parameter | Takes | Source |
+|---|---|---|
+| `files` | absolute paths | any readable file: a screenshot on disk, a PDF, a Desktop upload, a file outside the project |
+| `images` | numbers | images pasted into this Claude chat (`[Image #N]`), read back from the session's transcript |
+
+Each one is copied into `<worker cwd>/.claude/worker-files/<worker-id>/`, inside the worker's own folder so every CLI
+and Codex's sandbox can read it. The message then lists the paths, and:
+
+- **Codex** also gets each image as a `localImage` input, so the model sees it, not only its path.
+- **Qwen Code and OpenCode** get every file as an ACP `resource_link` (a `file://` URI) and read it with their own tools.
+
+Up to 10 attachments per message, 20 MB each and 50 MB together. `.claude/worker-files/` is added to the repository's
+local `.git/info/exclude` (never committed), so the copies stay out of `git status`. The copies are removed when the
+worker is deleted, or when the Claude session ends; the originals are never touched. **Retry** copies the first task's
+attachments again for the new worker.
+
+Pasted images rely on Claude Code's transcript format. If a future version stores them differently, the call fails with
+a clear error and `files` keeps working.
 
 **Wake-up notices.** When a worker that Claude started with `worker_start` finishes, fails or starts waiting for approval,
 the plugin submits a short automatic notice to the Claude session. The notice carries only the worker ID and status, never the worker's output:
@@ -244,6 +267,7 @@ and Claude has no way to approve them either.
 - **Only "allow once".** An "allow always" option offered by an ACP CLI is never selected for you.
 - **Terminals and questions.** The ACP terminal client and elicitation are not implemented, and the terminal capability is not advertised. A CLI can still run commands with its own tools. An interactive question from Codex is returned unanswered with a hint to interrupt and answer as a follow-up message.
 - **Same-account trust.** The bridge is reachable by anything on your machine that can read the runtime directory, which is limited to your user. There is no network exposure. Do not point workers at folders you would not let a coding agent edit.
+- **Attachments are copies.** A file you hand over is copied into the worker's folder, where the worker can read it like any project file. Pass only what the task needs; the copy is removed with the worker. A `.claude` folder that is a symlink pointing outside the worker's folder is refused.
 - **Parallel edits.** Workers share your file system. The plugin does not lock files or create git worktrees; give each worker its own folder or worktree when several change files at once.
 
 ## Costs and quotas

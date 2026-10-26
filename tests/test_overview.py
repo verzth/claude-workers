@@ -95,7 +95,7 @@ class OverviewTests(unittest.TestCase):
         foreign = self.worker(outside)
         result = a.control({'hostSessionId': b.session, 'action': 'send', 'id': w.id, 'message': 'Correct parent'})
         self.assertEqual(result, {'delivery': 'queued'})
-        self.assertEqual(list(w.messages), ['Correct parent'])
+        self.assertEqual([m['text'] for m in w.messages], ['Correct parent'])
         with self.assertRaisesRegex(ValueError, 'outside'):
             a.control({'hostSessionId': outside.session, 'action': 'send', 'id': foreign.id, 'message': 'no'})
         with self.assertRaisesRegex(ValueError, 'does not belong'):

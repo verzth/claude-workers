@@ -109,12 +109,18 @@ history; rewrite only what is relevant.
 ## Step 6: Running external workers (workers plugin)
 
 Tools (full names use the `mcp__workers__` prefix):
-- `worker_start(kind, task, cwd?, model?)`: `kind` is `codex`, `qwen` or `opencode`; `cwd` is an absolute
+- `worker_start(kind, task, cwd?, model?, files?, images?)`: `kind` is `codex`, `qwen` or `opencode`; `cwd` is an absolute
   path (default: the session folder); `task` is 1 to 32,000 characters. Returns an id at once.
 - `worker_status(id?)`: state, recent tool calls, pending approvals and the final output. Without `id`,
   lists this session's workers.
 - `worker_send(id, message)`: follow-up. Codex steers a running turn; Qwen Code and OpenCode queue it
   (up to 12). It never approves anything.
+- Attachments (`files`, `images` on both `worker_start` and `worker_send`): a worker cannot see what the
+  user attached in the chat. Pass absolute paths in `files` (screenshots, PDFs, Desktop uploads) and the
+  numbers of images pasted in this chat (`[Image #N]`) in `images`. They are copied into
+  `<cwd>/.claude/worker-files/<worker-id>/` and the worker gets the paths (Codex also sees images
+  directly). Do not describe an image in words instead of attaching it, and do not paste file contents
+  into the brief: attach the file and name it in the brief ("the attached screenshot shows the bug").
 - `worker_interrupt(id)`: cancels the turn and clears the queue. To redirect any worker: interrupt, wait
   for the interrupted state, then send the new message.
 - `worker_wait(id, timeout_ms?)`: waits up to 7 seconds and returns the state.

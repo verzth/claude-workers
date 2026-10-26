@@ -24,7 +24,12 @@ def answer(msg, result):
 
 def prompt(msg, native, tid):
     p = msg["params"]
-    text = (p["input"] if native else p["prompt"])[0]["text"]
+    blocks = p["input"] if native else p["prompt"]
+    text = blocks[0]["text"]
+    # Attachments beyond the text block: Codex localImage paths, ACP resource_link URIs.
+    extras = [b.get("path") or b.get("uri") for b in blocks[1:]]
+    if extras:
+        text += " [" + blocks[1]["type"] + ": " + ", ".join(extras) + "]"
     cancelled.clear()
     if native:
         event("turn/started", {"turn": {"id": tid}})
