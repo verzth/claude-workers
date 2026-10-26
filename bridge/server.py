@@ -25,7 +25,7 @@ from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 RUNTIME_KEY_VERSION = "0.2.0"  # Compatible 0.2.x updates reconnect to the same live bridge.
 COMMANDS = {"codex": ["codex", "app-server", "--stdio"],
             "qwen": ["qwen", "--acp"], "opencode": ["opencode", "acp"]}
@@ -138,8 +138,11 @@ class Rpc:
             self.exited(self.proc.returncode)
 
     def _stderr(self):
-        for line in self.proc.stderr:
-            self.event("bridge/log", {"message": clean(line)})
+        try:
+            for line in self.proc.stderr:
+                self.event("bridge/log", {"message": clean(line)})
+        except ValueError:
+            pass  # the pipe was closed by close() while a line was being read
 
     def close(self):
         with self.close_lock:
@@ -246,7 +249,7 @@ class Worker:
                 session = self.rpc.call("session/new", {"cwd": self.cwd, "mcpServers": []}, timeout=90)
                 self.session_id = session["sessionId"]
                 if self.model:
-                    self.rpc.call("session/set_model", {"sessionId": self.session_id, "modelId": self.model})
+                    self._set_acp_model(session)
             with self.lock:
                 if self.cancelled or self.closed:
                     return
@@ -467,6 +470,26 @@ class Worker:
             self.record("tool", f"Wrote {path.relative_to(self.cwd)}")
             return {}
         raise ValueError(f"Unsupported ACP request: {method}")
+
+    def _set_acp_model(self, session):
+        # ACP agents pick a model in one of two ways. Newer ones (OpenCode 2.x, Qwen Code) list a
+        # "model" entry in session/new's configOptions and change it with session/set_config_option;
+        # older ones only accept session/set_model. Use what the agent advertised.
+        options = session.get("configOptions") if isinstance(session, dict) else None
+        model_option = next((o for o in options or [] if isinstance(o, dict)
+                             and (o.get("id") == "model" or o.get("category") == "model")), None)
+        if model_option is not None:
+            values = [v.get("value") for v in model_option.get("options") or [] if isinstance(v, dict)]
+            # Exact ID, or the same name with a suffix such as Qwen's "qwen3.7-flash(openai)".
+            matches = [v for v in values if v == self.model] or \
+                      [v for v in values if isinstance(v, str) and v.split("(")[0] == self.model]
+            if len(matches) == 1:
+                self.rpc.call("session/set_config_option", {"sessionId": self.session_id,
+                                                            "configId": model_option["id"], "value": matches[0]})
+                return
+            if "models" not in session:
+                raise ValueError(f"Model {self.model!r} is not offered by this {self.kind} session")
+        self.rpc.call("session/set_model", {"sessionId": self.session_id, "modelId": self.model})
 
     def send(self, message):
         message = checked_text(message)

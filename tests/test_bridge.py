@@ -68,6 +68,46 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual([m["role"] for m in history], ["user", "assistant", "user", "assistant"])
         self.assertEqual([m["text"] for m in history], ["first", "Reply: first", "second", "Reply: second"])
 
+    def test_acp_model_uses_config_options_when_advertised(self):
+        # OpenCode 2.x: no session/set_model; the model is a config option of the session.
+        w = bridge.Worker("opencode", self.tmp.name, None, model="fake/other",
+                          argv=[sys.executable, str(ROOT / "tests/fake_agent.py"), "--config-options"])
+        self.workers.append(w)
+        w.start()
+        wait_until(lambda: w.status in {"idle", "error"})
+        self.assertEqual(w.error, "")
+        w.send("hello")
+        wait_until(lambda: w.status == "done")
+        self.assertEqual(w.output, "Reply: hello [fake/other]")
+
+    def test_acp_model_matches_a_suffixed_id(self):
+        # Qwen Code lists "name(authType)"; the pane's catalog has the plain name.
+        w = bridge.Worker("qwen", self.tmp.name, None, model="fake-flash",
+                          argv=[sys.executable, str(ROOT / "tests/fake_agent.py"), "--config-options"])
+        self.workers.append(w)
+        w.start()
+        wait_until(lambda: w.status in {"idle", "error"})
+        self.assertEqual(w.error, "")
+        w.send("hi")
+        wait_until(lambda: w.status == "done")
+        self.assertEqual(w.output, "Reply: hi [fake-flash(openai)]")
+
+    def test_acp_model_not_offered_is_a_clear_error(self):
+        w = bridge.Worker("opencode", self.tmp.name, None, model="fake/missing",
+                          argv=[sys.executable, str(ROOT / "tests/fake_agent.py"), "--config-options"])
+        self.workers.append(w)
+        w.start()
+        wait_until(lambda: w.status == "error")
+        self.assertIn("not offered", w.error)
+
+    def test_acp_model_falls_back_to_set_model(self):
+        w = bridge.Worker("qwen", self.tmp.name, None, model="any/model",
+                          argv=[sys.executable, str(ROOT / "tests/fake_agent.py")])
+        self.workers.append(w)
+        w.start()
+        wait_until(lambda: w.status in {"idle", "error"})
+        self.assertEqual(w.error, "")
+
     def test_codex_tool_events_and_final_output(self):
         w = self.worker("codex", "first task")
         wait_until(lambda: w.status == "done")

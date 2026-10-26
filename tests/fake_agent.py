@@ -4,6 +4,10 @@ import sys
 import threading
 import time
 
+# --config-options: behave like OpenCode 2.x, which lists its model in session/new's
+# configOptions, takes session/set_config_option and has no session/set_model.
+CONFIG_OPTIONS = "--config-options" in sys.argv
+model = "fake/default"
 lock = threading.Lock()
 cancelled = threading.Event()
 turn_serial = 0
@@ -34,7 +38,8 @@ def prompt(msg, native, tid):
         event("turn/completed", {"turn": {"id": tid, "status": "interrupted" if cancelled.is_set() else "completed"}})
     else:
         event("session/update", {"sessionId": "session-test", "update": {"sessionUpdate": "tool_call_update", "toolCallId": "acp-tool", "status": "completed"}})
-        event("session/update", {"sessionId": "session-test", "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Reply: " + text}}})
+        suffix = f" [{model}]" if CONFIG_OPTIONS else ""
+        event("session/update", {"sessionId": "session-test", "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Reply: " + text + suffix}}})
         answer(msg, {"stopReason": "cancelled" if cancelled.is_set() else "end_turn"})
 
 for line in sys.stdin:
@@ -45,7 +50,19 @@ for line in sys.stdin:
     elif method == "thread/start":
         answer(msg, {"thread": {"id": "thread-test"}})
     elif method == "session/new":
-        answer(msg, {"sessionId": "session-test"})
+        result = {"sessionId": "session-test"}
+        if CONFIG_OPTIONS:
+            result["configOptions"] = [{"id": "model", "name": "Model", "category": "model", "type": "select",
+                                        "currentValue": model,
+                                        "options": [{"value": "fake/default"}, {"value": "fake/other"},
+                                                    {"value": "fake-flash(openai)"}]}]
+        answer(msg, result)
+    elif method == "session/set_model" and CONFIG_OPTIONS:
+        emit({"jsonrpc": "2.0", "id": msg["id"],
+              "error": {"code": -32601, "message": '"Method not found": session/set_model'}})
+    elif method == "session/set_config_option":
+        model = msg["params"]["value"]
+        answer(msg, {"configOptions": []})
     elif method in {"turn/start", "session/prompt"}:
         turn_serial += 1
         tid = str(turn_serial)
